@@ -1,0 +1,455 @@
+{
+  "agent": {
+    "name": "SGIP Application Assistant",
+    "version": "1.0.0",
+    "description": "Automates SGIP application packaging: extracts from plans/bills, runs PVWatts v8, computes SGIP checks, generates SGIP-ready PDFs, and outputs a submission checklist + ZIP.",
+    "env": {
+      "NREL_API_KEY": {
+        "type": "secret",
+        "required": true,
+        "description": "Get a free API key at developer.nrel.gov"
+      }
+    },
+    "system_prompt": "You are SGIP Application Assistant. You ingest user uploads (plans, bills), extract and normalize structured data, run PVWatts v8 (or accept a user PDF), compute SGIP checks (\u226575% renewable charging, discharge hours, TEPC cap), generate compact reviewer-friendly PDFs (Arial/Helvetica), use SGIP-friendly filenames, and output a submission checklist + ZIP. Never invent values\u2014use 'TBD' and prompt for missing fields. Mask Account/Meter to last 4 in public summaries. Leave serial numbers as 'To be provided at Incentive Claim'. Default array_type=1 (fixed roof) and module_type=0 (standard) unless specified. Losses default 14%. If PVWatts API fails, prompt the user to upload a PVWatts PDF and continue.",
+    "variables": {
+      "plansetPDF": "",
+      "utilityBills": [],
+      "pvwattsUserPdf": "",
+      "projectAddress": "",
+      "extractedPlanData": {
+        "pvModules": [],
+        "pvPower": {
+          "dcKw": 0,
+          "acKw": 0
+        },
+        "inverters": [],
+        "optimizers": [],
+        "ess": {
+          "make": "",
+          "model": "",
+          "usableKwh": 0,
+          "ratedKw": 0
+        },
+        "pvOrientation": {
+          "tilt": 0,
+          "azimuth": 0
+        },
+        "singleLinePageRef": "",
+        "meteringPoints": ""
+      },
+      "extractedBillData": {
+        "accountName": "",
+        "accountId": "",
+        "meterId": "",
+        "serviceAddress": "",
+        "rateSchedule": "",
+        "utility": "",
+        "billingPeriods": []
+      },
+      "pvWattsData": {
+        "annualKwh": 0,
+        "monthlyKwh": [],
+        "capacityFactor": 0,
+        "solradAnnual": 0,
+        "solradMonthly": [],
+        "stationInfo": {},
+        "pdfUrl": ""
+      },
+      "calculationResults": {
+        "averageDailyKwh": [],
+        "annualizedKwh": 0,
+        "dischargeHours": 0,
+        "pvChargingRequired": 0,
+        "pvChargingTest": false,
+        "tepcCap": 0,
+        "incentiveExpected": 0
+      },
+      "fileNaming": {
+        "siteAddrCompact": "",
+        "dateStamp": "",
+        "versionMajMin": "1.0",
+        "billDateRange": ""
+      },
+      "generatedDocuments": {
+        "utilityBillsCombined": "",
+        "electricLoadJustification": "",
+        "pvWattsReport": "",
+        "solarLoadJustification": "",
+        "solarLoadJustificationPacket": "",
+        "pmp": "",
+        "resiliencyAttestation": "",
+        "equipmentSpecificationsCover": "",
+        "batterySpecs": "",
+        "inverterSpecs": "",
+        "moduleSpecs": "",
+        "optimizerSpecs": "",
+        "submissionChecklist": "",
+        "changeLog": "",
+        "zipPath": ""
+      }
+    }
+  },
+  "functions": [
+    {
+      "id": "extractPlansData",
+      "description": "Parse PV/ESS specs from plans PDF text into structured JSON.",
+      "inputs": {
+        "plansetPdfUrl": "string"
+      },
+      "outputs": {
+        "extractedPlanData": "object"
+      }
+    },
+    {
+      "id": "extractUtilityBillsData",
+      "description": "OCR/parse utility bills (PDF or images) into structured JSON (periods, IDs).",
+      "inputs": {
+        "utilityBillUrls": "string[]"
+      },
+      "outputs": {
+        "extractedBillData": "object"
+      }
+    },
+    {
+      "id": "combineBillsIntoPdf",
+      "description": "Combine uploaded bill PDFs/images into one searchable PDF with SGIP naming.",
+      "inputs": {
+        "utilityBillUrls": "string[]",
+        "siteAddrCompact": "string",
+        "billDateRange": "string"
+      },
+      "outputs": {
+        "pdfUrl": "string"
+      }
+    },
+    {
+      "id": "interactWithPVWatts",
+      "description": "Call NREL PVWatts v8 with address, dcKw, tilt, azimuth, losses to get annual/monthly kWh and generate a PDF summary.",
+      "inputs": {
+        "projectAddress": "string",
+        "dcKw": "number",
+        "tilt": "number",
+        "azimuth": "number",
+        "losses": "number"
+      },
+      "outputs": {
+        "pvWattsData": "object"
+      }
+    },
+    {
+      "id": "calculateSGIPMetrics",
+      "description": "Compute average daily kWh, discharge hours, \u226575% PV test, TEPC cap.",
+      "inputs": {
+        "extractedBillData": "object",
+        "extractedPlanData": "object",
+        "pvWattsData": "object"
+      },
+      "outputs": {
+        "calculationResults": "object"
+      }
+    },
+    {
+      "id": "generateDocuments",
+      "description": "Create Electric Load Justification, Solar Load Justification, and merge PVWatts to produce the Packet. Generate submission checklist.",
+      "inputs": {
+        "extractedBillData": "object",
+        "extractedPlanData": "object",
+        "pvWattsData": "object",
+        "calculationResults": "object",
+        "fileNaming": "object"
+      },
+      "outputs": {
+        "generatedDocuments": "object"
+      }
+    },
+    {
+      "id": "createZip",
+      "description": "Bundle selected generated documents into a single ZIP for download.",
+      "inputs": {
+        "files": "string[]",
+        "siteAddrCompact": "string"
+      },
+      "outputs": {
+        "zipUrl": "string"
+      }
+    }
+  ],
+  "flows": [
+    {
+      "id": "upload",
+      "type": "user_input",
+      "title": "Step 1 \u2014 Upload",
+      "fields": [
+        {
+          "id": "projectAddress",
+          "label": "Project Address",
+          "type": "text",
+          "required": true,
+          "bind": "projectAddress"
+        },
+        {
+          "id": "plansetPDF",
+          "label": "Planset (PV + ESS, PDF)",
+          "type": "file",
+          "accept": [
+            "application/pdf"
+          ],
+          "required": true,
+          "bind": "plansetPDF"
+        },
+        {
+          "id": "utilityBills",
+          "label": "Utility Bills (PDFs or images)",
+          "type": "file",
+          "multiple": true,
+          "accept": [
+            "application/pdf",
+            "image/*"
+          ],
+          "required": true,
+          "bind": "utilityBills"
+        },
+        {
+          "id": "pvwattsUserPdf",
+          "label": "PVWatts PDF (optional fallback)",
+          "type": "file",
+          "accept": [
+            "application/pdf"
+          ],
+          "required": false,
+          "bind": "pvwattsUserPdf"
+        }
+      ],
+      "transitions": {
+        "next": "prepNaming"
+      }
+    },
+    {
+      "id": "prepNaming",
+      "type": "generate_text",
+      "title": "Normalize Address & Filenames",
+      "prompt": "From the address: {{projectAddress}} return strict JSON with compact filename token and today's date: {\"siteAddrCompact\":\"<e.g., 290W10thSt_Pittsburg>\",\"dateStamp\":\"YYYYMMDD\"}.",
+      "outputs": {
+        "json": "fileNaming"
+      },
+      "transitions": {
+        "next": "extractPlansText"
+      }
+    },
+    {
+      "id": "extractPlansText",
+      "type": "extract_text",
+      "title": "Extract Text from Plans",
+      "file": "{{plansetPDF}}",
+      "outputs": {
+        "text": "plans_text"
+      },
+      "transitions": {
+        "next": "parsePlans"
+      }
+    },
+    {
+      "id": "parsePlans",
+      "type": "generate_text",
+      "title": "Parse Plans",
+      "prompt": "Parse PV/ESS plans. Input:\\n---\\n{{plans_text}}\\n---\\nReturn JSON only:{ \"pvModules\":[{\"make\":\"\",\"model\":\"\",\"quantity\":0}],\"pvPower\":{\"dcKw\":0,\"acKw\":0},\"inverters\":[{\"make\":\"\",\"model\":\"\",\"acKw\":0}],\"optimizers\":[{\"make\":\"\",\"model\":\"\"}],\"ess\":{\"make\":\"\",\"model\":\"\",\"usableKwh\":0,\"ratedKw\":0},\"pvOrientation\":{\"tilt\":0,\"azimuth\":0},\"singleLinePageRef\":\"\",\"meteringPoints\":\"\" }",
+      "outputs": {
+        "json": "extractedPlanData"
+      },
+      "transitions": {
+        "next": "extractBillsData"
+      }
+    },
+    {
+      "id": "extractBillsData",
+      "type": "runFunction",
+      "functionId": "extractUtilityBillsData",
+      "configuration": {
+        "utilityBillUrls": "{{utilityBills}}"
+      },
+      "outputs": {
+        "json": "extractedBillData"
+      },
+      "transitions": {
+        "next": "combineBillsPdf"
+      }
+    },
+    {
+      "id": "combineBillsPdf",
+      "type": "runFunction",
+      "functionId": "combineBillsIntoPdf",
+      "configuration": {
+        "utilityBillUrls": "{{utilityBills}}",
+        "siteAddrCompact": "{{fileNaming.siteAddrCompact}}",
+        "billDateRange": "{{fileNaming.billDateRange}}"
+      },
+      "outputs": {
+        "json": "generatedDocuments.utilityBillsCombined"
+      },
+      "transitions": {
+        "next": "confirmData"
+      }
+    },
+    {
+      "id": "confirmData",
+      "type": "user_input",
+      "title": "Confirm & Edit Extracted Data",
+      "fields": [
+        {
+          "id": "tilt",
+          "label": "PV Tilt (degrees)",
+          "type": "number",
+          "bind": "extractedPlanData.pvOrientation.tilt"
+        },
+        {
+          "id": "azimuth",
+          "label": "PV Azimuth (degrees)",
+          "type": "number",
+          "bind": "extractedPlanData.pvOrientation.azimuth"
+        },
+        {
+          "id": "dcKw",
+          "label": "PV DC Size (kW)",
+          "type": "number",
+          "bind": "extractedPlanData.pvPower.dcKw"
+        },
+        {
+          "id": "essUsable",
+          "label": "ESS Usable (kWh)",
+          "type": "number",
+          "bind": "extractedPlanData.ess.usableKwh"
+        },
+        {
+          "id": "essRatedKw",
+          "label": "ESS Rated Power (kW)",
+          "type": "number",
+          "bind": "extractedPlanData.ess.ratedKw"
+        }
+      ],
+      "transitions": {
+        "next": "runPVWatts"
+      }
+    },
+    {
+      "id": "runPVWatts",
+      "type": "runFunction",
+      "functionId": "interactWithPVWatts",
+      "configuration": {
+        "projectAddress": "{{projectAddress}}",
+        "dcKw": "{{extractedPlanData.pvPower.dcKw}}",
+        "tilt": "{{extractedPlanData.pvOrientation.tilt}}",
+        "azimuth": "{{extractedPlanData.pvOrientation.azimuth}}",
+        "losses": 14
+      },
+      "outputs": {
+        "json": "pvWattsData"
+      },
+      "transitions": {
+        "next": "calculate"
+      },
+      "on_error": {
+        "next": "pvwattsFallback"
+      }
+    },
+    {
+      "id": "pvwattsFallback",
+      "type": "user_input",
+      "title": "PVWatts Fallback",
+      "fields": [
+        {
+          "id": "pvwattsUserPdf",
+          "label": "Upload PVWatts PDF (if API blocked)",
+          "type": "file",
+          "accept": [
+            "application/pdf"
+          ],
+          "bind": "pvwattsUserPdf"
+        }
+      ],
+      "transitions": {
+        "next": "calculate"
+      }
+    },
+    {
+      "id": "calculate",
+      "type": "runFunction",
+      "functionId": "calculateSGIPMetrics",
+      "configuration": {
+        "extractedBillData": "{{extractedBillData}}",
+        "extractedPlanData": "{{extractedPlanData}}",
+        "pvWattsData": "{{pvWattsData}}"
+      },
+      "outputs": {
+        "json": "calculationResults"
+      },
+      "transitions": {
+        "next": "generateDocs"
+      }
+    },
+    {
+      "id": "generateDocs",
+      "type": "runFunction",
+      "functionId": "generateDocuments",
+      "configuration": {
+        "extractedBillData": "{{extractedBillData}}",
+        "extractedPlanData": "{{extractedPlanData}}",
+        "pvWattsData": "{{pvWattsData}}",
+        "calculationResults": "{{calculationResults}}",
+        "fileNaming": "{{fileNaming}}"
+      },
+      "outputs": {
+        "json": "generatedDocuments"
+      },
+      "transitions": {
+        "next": "reviewDownloads"
+      }
+    },
+    {
+      "id": "reviewDownloads",
+      "type": "generate_text",
+      "title": "Your SGIP Package is Ready",
+      "prompt": "Summarize the generated documents with links from generatedDocuments; include a short checklist for SGIP portal upload. Return markdown.",
+      "outputs": {
+        "text": "summary_md"
+      },
+      "transitions": {
+        "next": "zipStep"
+      }
+    },
+    {
+      "id": "zipStep",
+      "type": "runFunction",
+      "functionId": "createZip",
+      "configuration": {
+        "files": [
+          "{{generatedDocuments.utilityBillsCombined}}",
+          "{{generatedDocuments.electricLoadJustification}}",
+          "{{generatedDocuments.pvWattsReport}}",
+          "{{generatedDocuments.solarLoadJustification}}",
+          "{{generatedDocuments.solarLoadJustificationPacket}}",
+          "{{generatedDocuments.pmp}}",
+          "{{generatedDocuments.resiliencyAttestation}}",
+          "{{generatedDocuments.equipmentSpecificationsCover}}",
+          "{{generatedDocuments.batterySpecs}}",
+          "{{generatedDocuments.inverterSpecs}}",
+          "{{generatedDocuments.moduleSpecs}}",
+          "{{generatedDocuments.optimizerSpecs}}",
+          "{{generatedDocuments.submissionChecklist}}",
+          "{{generatedDocuments.changeLog}}"
+        ],
+        "siteAddrCompact": "{{fileNaming.siteAddrCompact}}"
+      },
+      "outputs": {
+        "json": "generatedDocuments.zipPath"
+      },
+      "transitions": {
+        "next": "end"
+      }
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "title": "Done"
+    }
+  ]
+}
