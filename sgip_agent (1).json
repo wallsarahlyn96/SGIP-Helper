@@ -1,455 +1,816 @@
-{
-  "agent": {
-    "name": "SGIP Application Assistant",
-    "version": "1.0.0",
-    "description": "Automates SGIP application packaging: extracts from plans/bills, runs PVWatts v8, computes SGIP checks, generates SGIP-ready PDFs, and outputs a submission checklist + ZIP.",
-    "env": {
-      "NREL_API_KEY": {
-        "type": "secret",
-        "required": true,
-        "description": "Get a free API key at developer.nrel.gov"
-      }
-    },
-    "system_prompt": "You are SGIP Application Assistant. You ingest user uploads (plans, bills), extract and normalize structured data, run PVWatts v8 (or accept a user PDF), compute SGIP checks (\u226575% renewable charging, discharge hours, TEPC cap), generate compact reviewer-friendly PDFs (Arial/Helvetica), use SGIP-friendly filenames, and output a submission checklist + ZIP. Never invent values\u2014use 'TBD' and prompt for missing fields. Mask Account/Meter to last 4 in public summaries. Leave serial numbers as 'To be provided at Incentive Claim'. Default array_type=1 (fixed roof) and module_type=0 (standard) unless specified. Losses default 14%. If PVWatts API fails, prompt the user to upload a PVWatts PDF and continue.",
-    "variables": {
-      "plansetPDF": "",
-      "utilityBills": [],
-      "pvwattsUserPdf": "",
-      "projectAddress": "",
-      "extractedPlanData": {
-        "pvModules": [],
-        "pvPower": {
-          "dcKw": 0,
-          "acKw": 0
-        },
-        "inverters": [],
-        "optimizers": [],
-        "ess": {
-          "make": "",
-          "model": "",
-          "usableKwh": 0,
-          "ratedKw": 0
-        },
-        "pvOrientation": {
-          "tilt": 0,
-          "azimuth": 0
-        },
-        "singleLinePageRef": "",
-        "meteringPoints": ""
-      },
-      "extractedBillData": {
-        "accountName": "",
-        "accountId": "",
-        "meterId": "",
-        "serviceAddress": "",
-        "rateSchedule": "",
-        "utility": "",
-        "billingPeriods": []
-      },
-      "pvWattsData": {
-        "annualKwh": 0,
-        "monthlyKwh": [],
-        "capacityFactor": 0,
-        "solradAnnual": 0,
-        "solradMonthly": [],
-        "stationInfo": {},
-        "pdfUrl": ""
-      },
-      "calculationResults": {
-        "averageDailyKwh": [],
-        "annualizedKwh": 0,
-        "dischargeHours": 0,
-        "pvChargingRequired": 0,
-        "pvChargingTest": false,
-        "tepcCap": 0,
-        "incentiveExpected": 0
-      },
-      "fileNaming": {
-        "siteAddrCompact": "",
-        "dateStamp": "",
-        "versionMajMin": "1.0",
-        "billDateRange": ""
-      },
-      "generatedDocuments": {
-        "utilityBillsCombined": "",
-        "electricLoadJustification": "",
-        "pvWattsReport": "",
-        "solarLoadJustification": "",
-        "solarLoadJustificationPacket": "",
-        "pmp": "",
-        "resiliencyAttestation": "",
-        "equipmentSpecificationsCover": "",
-        "batterySpecs": "",
-        "inverterSpecs": "",
-        "moduleSpecs": "",
-        "optimizerSpecs": "",
-        "submissionChecklist": "",
-        "changeLog": "",
-        "zipPath": ""
-      }
-    }
+# Create project structure and files and package into a zip for download
+import os, json, zipfile, textwrap, pathlib
+
+base = "/mnt/data/sgip-agent"
+os.makedirs(base, exist_ok=True)
+os.makedirs(f"{base}/src/services", exist_ok=True)
+os.makedirs(f"{base}/src/utils", exist_ok=True)
+os.makedirs(f"{base}/public", exist_ok=True)
+os.makedirs(f"{base}/uploads", exist_ok=True)
+os.makedirs(f"{base}/output", exist_ok=True)
+
+package_json = r'''{
+  "name": "sgip-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "build": "tsc",
+    "start": "node dist/src/server.js"
   },
-  "functions": [
-    {
-      "id": "extractPlansData",
-      "description": "Parse PV/ESS specs from plans PDF text into structured JSON.",
-      "inputs": {
-        "plansetPdfUrl": "string"
-      },
-      "outputs": {
-        "extractedPlanData": "object"
-      }
-    },
-    {
-      "id": "extractUtilityBillsData",
-      "description": "OCR/parse utility bills (PDF or images) into structured JSON (periods, IDs).",
-      "inputs": {
-        "utilityBillUrls": "string[]"
-      },
-      "outputs": {
-        "extractedBillData": "object"
-      }
-    },
-    {
-      "id": "combineBillsIntoPdf",
-      "description": "Combine uploaded bill PDFs/images into one searchable PDF with SGIP naming.",
-      "inputs": {
-        "utilityBillUrls": "string[]",
-        "siteAddrCompact": "string",
-        "billDateRange": "string"
-      },
-      "outputs": {
-        "pdfUrl": "string"
-      }
-    },
-    {
-      "id": "interactWithPVWatts",
-      "description": "Call NREL PVWatts v8 with address, dcKw, tilt, azimuth, losses to get annual/monthly kWh and generate a PDF summary.",
-      "inputs": {
-        "projectAddress": "string",
-        "dcKw": "number",
-        "tilt": "number",
-        "azimuth": "number",
-        "losses": "number"
-      },
-      "outputs": {
-        "pvWattsData": "object"
-      }
-    },
-    {
-      "id": "calculateSGIPMetrics",
-      "description": "Compute average daily kWh, discharge hours, \u226575% PV test, TEPC cap.",
-      "inputs": {
-        "extractedBillData": "object",
-        "extractedPlanData": "object",
-        "pvWattsData": "object"
-      },
-      "outputs": {
-        "calculationResults": "object"
-      }
-    },
-    {
-      "id": "generateDocuments",
-      "description": "Create Electric Load Justification, Solar Load Justification, and merge PVWatts to produce the Packet. Generate submission checklist.",
-      "inputs": {
-        "extractedBillData": "object",
-        "extractedPlanData": "object",
-        "pvWattsData": "object",
-        "calculationResults": "object",
-        "fileNaming": "object"
-      },
-      "outputs": {
-        "generatedDocuments": "object"
-      }
-    },
-    {
-      "id": "createZip",
-      "description": "Bundle selected generated documents into a single ZIP for download.",
-      "inputs": {
-        "files": "string[]",
-        "siteAddrCompact": "string"
-      },
-      "outputs": {
-        "zipUrl": "string"
-      }
-    }
-  ],
-  "flows": [
-    {
-      "id": "upload",
-      "type": "user_input",
-      "title": "Step 1 \u2014 Upload",
-      "fields": [
-        {
-          "id": "projectAddress",
-          "label": "Project Address",
-          "type": "text",
-          "required": true,
-          "bind": "projectAddress"
-        },
-        {
-          "id": "plansetPDF",
-          "label": "Planset (PV + ESS, PDF)",
-          "type": "file",
-          "accept": [
-            "application/pdf"
-          ],
-          "required": true,
-          "bind": "plansetPDF"
-        },
-        {
-          "id": "utilityBills",
-          "label": "Utility Bills (PDFs or images)",
-          "type": "file",
-          "multiple": true,
-          "accept": [
-            "application/pdf",
-            "image/*"
-          ],
-          "required": true,
-          "bind": "utilityBills"
-        },
-        {
-          "id": "pvwattsUserPdf",
-          "label": "PVWatts PDF (optional fallback)",
-          "type": "file",
-          "accept": [
-            "application/pdf"
-          ],
-          "required": false,
-          "bind": "pvwattsUserPdf"
-        }
-      ],
-      "transitions": {
-        "next": "prepNaming"
-      }
-    },
-    {
-      "id": "prepNaming",
-      "type": "generate_text",
-      "title": "Normalize Address & Filenames",
-      "prompt": "From the address: {{projectAddress}} return strict JSON with compact filename token and today's date: {\"siteAddrCompact\":\"<e.g., 290W10thSt_Pittsburg>\",\"dateStamp\":\"YYYYMMDD\"}.",
-      "outputs": {
-        "json": "fileNaming"
-      },
-      "transitions": {
-        "next": "extractPlansText"
-      }
-    },
-    {
-      "id": "extractPlansText",
-      "type": "extract_text",
-      "title": "Extract Text from Plans",
-      "file": "{{plansetPDF}}",
-      "outputs": {
-        "text": "plans_text"
-      },
-      "transitions": {
-        "next": "parsePlans"
-      }
-    },
-    {
-      "id": "parsePlans",
-      "type": "generate_text",
-      "title": "Parse Plans",
-      "prompt": "Parse PV/ESS plans. Input:\\n---\\n{{plans_text}}\\n---\\nReturn JSON only:{ \"pvModules\":[{\"make\":\"\",\"model\":\"\",\"quantity\":0}],\"pvPower\":{\"dcKw\":0,\"acKw\":0},\"inverters\":[{\"make\":\"\",\"model\":\"\",\"acKw\":0}],\"optimizers\":[{\"make\":\"\",\"model\":\"\"}],\"ess\":{\"make\":\"\",\"model\":\"\",\"usableKwh\":0,\"ratedKw\":0},\"pvOrientation\":{\"tilt\":0,\"azimuth\":0},\"singleLinePageRef\":\"\",\"meteringPoints\":\"\" }",
-      "outputs": {
-        "json": "extractedPlanData"
-      },
-      "transitions": {
-        "next": "extractBillsData"
-      }
-    },
-    {
-      "id": "extractBillsData",
-      "type": "runFunction",
-      "functionId": "extractUtilityBillsData",
-      "configuration": {
-        "utilityBillUrls": "{{utilityBills}}"
-      },
-      "outputs": {
-        "json": "extractedBillData"
-      },
-      "transitions": {
-        "next": "combineBillsPdf"
-      }
-    },
-    {
-      "id": "combineBillsPdf",
-      "type": "runFunction",
-      "functionId": "combineBillsIntoPdf",
-      "configuration": {
-        "utilityBillUrls": "{{utilityBills}}",
-        "siteAddrCompact": "{{fileNaming.siteAddrCompact}}",
-        "billDateRange": "{{fileNaming.billDateRange}}"
-      },
-      "outputs": {
-        "json": "generatedDocuments.utilityBillsCombined"
-      },
-      "transitions": {
-        "next": "confirmData"
-      }
-    },
-    {
-      "id": "confirmData",
-      "type": "user_input",
-      "title": "Confirm & Edit Extracted Data",
-      "fields": [
-        {
-          "id": "tilt",
-          "label": "PV Tilt (degrees)",
-          "type": "number",
-          "bind": "extractedPlanData.pvOrientation.tilt"
-        },
-        {
-          "id": "azimuth",
-          "label": "PV Azimuth (degrees)",
-          "type": "number",
-          "bind": "extractedPlanData.pvOrientation.azimuth"
-        },
-        {
-          "id": "dcKw",
-          "label": "PV DC Size (kW)",
-          "type": "number",
-          "bind": "extractedPlanData.pvPower.dcKw"
-        },
-        {
-          "id": "essUsable",
-          "label": "ESS Usable (kWh)",
-          "type": "number",
-          "bind": "extractedPlanData.ess.usableKwh"
-        },
-        {
-          "id": "essRatedKw",
-          "label": "ESS Rated Power (kW)",
-          "type": "number",
-          "bind": "extractedPlanData.ess.ratedKw"
-        }
-      ],
-      "transitions": {
-        "next": "runPVWatts"
-      }
-    },
-    {
-      "id": "runPVWatts",
-      "type": "runFunction",
-      "functionId": "interactWithPVWatts",
-      "configuration": {
-        "projectAddress": "{{projectAddress}}",
-        "dcKw": "{{extractedPlanData.pvPower.dcKw}}",
-        "tilt": "{{extractedPlanData.pvOrientation.tilt}}",
-        "azimuth": "{{extractedPlanData.pvOrientation.azimuth}}",
-        "losses": 14
-      },
-      "outputs": {
-        "json": "pvWattsData"
-      },
-      "transitions": {
-        "next": "calculate"
-      },
-      "on_error": {
-        "next": "pvwattsFallback"
-      }
-    },
-    {
-      "id": "pvwattsFallback",
-      "type": "user_input",
-      "title": "PVWatts Fallback",
-      "fields": [
-        {
-          "id": "pvwattsUserPdf",
-          "label": "Upload PVWatts PDF (if API blocked)",
-          "type": "file",
-          "accept": [
-            "application/pdf"
-          ],
-          "bind": "pvwattsUserPdf"
-        }
-      ],
-      "transitions": {
-        "next": "calculate"
-      }
-    },
-    {
-      "id": "calculate",
-      "type": "runFunction",
-      "functionId": "calculateSGIPMetrics",
-      "configuration": {
-        "extractedBillData": "{{extractedBillData}}",
-        "extractedPlanData": "{{extractedPlanData}}",
-        "pvWattsData": "{{pvWattsData}}"
-      },
-      "outputs": {
-        "json": "calculationResults"
-      },
-      "transitions": {
-        "next": "generateDocs"
-      }
-    },
-    {
-      "id": "generateDocs",
-      "type": "runFunction",
-      "functionId": "generateDocuments",
-      "configuration": {
-        "extractedBillData": "{{extractedBillData}}",
-        "extractedPlanData": "{{extractedPlanData}}",
-        "pvWattsData": "{{pvWattsData}}",
-        "calculationResults": "{{calculationResults}}",
-        "fileNaming": "{{fileNaming}}"
-      },
-      "outputs": {
-        "json": "generatedDocuments"
-      },
-      "transitions": {
-        "next": "reviewDownloads"
-      }
-    },
-    {
-      "id": "reviewDownloads",
-      "type": "generate_text",
-      "title": "Your SGIP Package is Ready",
-      "prompt": "Summarize the generated documents with links from generatedDocuments; include a short checklist for SGIP portal upload. Return markdown.",
-      "outputs": {
-        "text": "summary_md"
-      },
-      "transitions": {
-        "next": "zipStep"
-      }
-    },
-    {
-      "id": "zipStep",
-      "type": "runFunction",
-      "functionId": "createZip",
-      "configuration": {
-        "files": [
-          "{{generatedDocuments.utilityBillsCombined}}",
-          "{{generatedDocuments.electricLoadJustification}}",
-          "{{generatedDocuments.pvWattsReport}}",
-          "{{generatedDocuments.solarLoadJustification}}",
-          "{{generatedDocuments.solarLoadJustificationPacket}}",
-          "{{generatedDocuments.pmp}}",
-          "{{generatedDocuments.resiliencyAttestation}}",
-          "{{generatedDocuments.equipmentSpecificationsCover}}",
-          "{{generatedDocuments.batterySpecs}}",
-          "{{generatedDocuments.inverterSpecs}}",
-          "{{generatedDocuments.moduleSpecs}}",
-          "{{generatedDocuments.optimizerSpecs}}",
-          "{{generatedDocuments.submissionChecklist}}",
-          "{{generatedDocuments.changeLog}}"
-        ],
-        "siteAddrCompact": "{{fileNaming.siteAddrCompact}}"
-      },
-      "outputs": {
-        "json": "generatedDocuments.zipPath"
-      },
-      "transitions": {
-        "next": "end"
-      }
-    },
-    {
-      "id": "end",
-      "type": "end",
-      "title": "Done"
-    }
-  ]
+  "dependencies": {
+    "@zip.js/zip.js": "^2.7.45",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^3.3.2",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^1.1.1",
+    "pdfkit": "^0.15.0",
+    "slugify": "^1.6.6",
+    "tesseract.js": "^5.0.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.5.4"
+  }
+}'''
+tsconfig = r'''{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "node",
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*", "public/**/*"]
+}'''
+env_sample = r'''PORT=5173
+NREL_API_KEY=YOUR_NREL_API_KEY_HERE
+STRICT_GEO=false'''
+gitignore = r'''node_modules/
+dist/
+uploads/
+output/
+.env
+.DS_Store'''
+
+server_ts = r'''import "dotenv/config";
+import express from "express";
+import multer from "multer";
+import path from "path";
+import fs from "fs/promises";
+import { extractBills, extractPlans } from "./services/extract.js";
+import { runPVWatts } from "./services/pvwatts.js";
+import { combineBillsToPdf, generateElectricLoadJustification, generateSolarLoadJustification, mergeTwoPdfs } from "./services/pdf.js";
+import { nameFiles, siteCompact } from "./utils/fileNaming.js";
+import { avgDaily, dischargeHours as dh, pv75Required, tepcCap } from "./utils/math.js";
+import { zipFiles } from "./services/zip.js";
+import type { CalculationResults, ExtractedBillData, ExtractedPlanData } from "./types.js";
+
+const app = express();
+const PORT = Number(process.env.PORT || 5173);
+const upload = multer({ dest: "uploads/" });
+
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+app.use(express.static("public"));
+app.use("/output", express.static("output"));
+
+async function ensureDirs() {
+  for (const d of ["uploads", "output"]) {
+    try { await fs.mkdir(d, { recursive: true }); } catch {}
+  }
 }
+ensureDirs();
+
+app.post("/api/upload", upload.fields([
+  { name: "plans", maxCount: 1 },
+  { name: "bills", maxCount: 24 },
+  { name: "pvwattsPdf", maxCount: 1 }
+]), async (req: any, res) => {
+  const plans = (req.files as any)?.plans?.[0]?.path;
+  const bills = ((req.files as any)?.bills || []).map((f: any) => f.path);
+  const pvwattsPdf = (req.files as any)?.pvwattsPdf?.[0]?.path;
+  const { address } = req.body;
+  if (!plans || bills.length === 0 || !address) {
+    return res.status(400).json({ error: "Upload plans, at least one bill, and provide project address." });
+  }
+  res.json({ plans, bills, pvwattsPdf, address });
+});
+
+app.post("/api/process", async (req, res) => {
+  const { plans, bills, address, storageTEPC, storageITC = 30 } = req.body as {
+    plans: string; bills: string[]; address: string; storageTEPC?: number; storageITC?: number;
+  };
+
+  const outDir = "output";
+  const SITE = siteCompact(address);
+  const namer = nameFiles(address);
+
+  // 1) Extract
+  const billDataPartial = await extractBills(bills);
+  const planDataPartial = await extractPlans(plans);
+
+  const billData: ExtractedBillData = {
+    accountName: billDataPartial.accountName || "",
+    accountId: billDataPartial.accountId || "",
+    meterId: billDataPartial.meterId || "",
+    serviceAddress: billDataPartial.serviceAddress || address,
+    rateSchedule: billDataPartial.rateSchedule || "",
+    utility: billDataPartial.utility || "Utility",
+    billingPeriods: billDataPartial.billingPeriods || []
+  };
+  const planData: ExtractedPlanData = {
+    pvModules: [],
+    pvPower: planDataPartial.pvPower || { dcKw: 0, acKw: 0 },
+    inverters: [],
+    ess: planDataPartial.ess || { make: "", model: "", usableKwh: 0 },
+    pvOrientation: planDataPartial.pvOrientation || { tilt: 20, azimuth: 180 }
+  };
+
+  // 2) Combine bills
+  const billRange = (() => {
+    const bps = billData.billingPeriods;
+    const first = bps[0]?.startDate?.slice(6, 10) + bps[0]?.startDate?.slice(0, 2);
+    const last = bps[bps.length - 1]?.endDate?.slice(6, 10) + bps[bps.length - 1]?.endDate?.slice(0, 2);
+    return (first && last) ? `${first}-${last}` : "Bills";
+  })();
+  const billsOut = path.join(outDir, namer.bills(billRange));
+  await combineBillsToPdf(bills, billsOut);
+
+  // 3) PVWatts
+  let pvw: any = null;
+  try {
+    pvw = await runPVWatts({
+      address,
+      dcKw: planData.pvPower.dcKw || 1,
+      tilt: planData.pvOrientation.tilt,
+      azimuth: planData.pvOrientation.azimuth,
+      siteAddrCompact: SITE,
+      outputDir: outDir
+    });
+  } catch (e: any) {
+    pvw = { error: e.message };
+  }
+
+  // 4) Calculations
+  const calc: CalculationResults = { averageDailyKwh: [] };
+  billData.billingPeriods.forEach(p => calc.averageDailyKwh.push(avgDaily(p.kWh, p.days)));
+  calc.dischargeHours = dh(planData.ess.usableKwh, planData.ess.ratedKw);
+  calc.pvChargingRequired = pv75Required(planData.ess.usableKwh || 0);
+  if (pvw?.annualKwh) calc.pvChargingTest = pvw.annualKwh >= (calc.pvChargingRequired || 0);
+  if (storageTEPC) calc.tepcCap = tepcCap(storageTEPC, (storageITC as number) / 100);
+
+  // 5) Electric Load Justification
+  const elj = await generateElectricLoadJustification({
+    addr: address, bills: billData, calc, outDir
+  });
+
+  // 6) Solar Load Justification + Packet
+  let slj: string | undefined;
+  let sljPacket: string | undefined;
+  if (pvw?.annualKwh) {
+    slj = await generateSolarLoadJustification({
+      addr: address, plan: planData, pvw, calc, outDir
+    });
+    const packetOut = path.join(outDir, nameFiles(address).sljPacket("1.0"));
+    await mergeTwoPdfs(slj, pvw.pdfPath, packetOut);
+    sljPacket = packetOut;
+  }
+
+  res.json({
+    ok: true,
+    extracted: { billData, planData },
+    pvwatts: pvw?.annualKwh ? pvw : { error: pvw?.error || "PVWatts not run" },
+    outputs: {
+      utilityBillsCombined: `/output/${path.basename(billsOut)}`,
+      electricLoadJustification: `/output/${path.basename(elj)}`,
+      pvWattsReport: pvw?.pdfPath ? `/output/${path.basename(pvw.pdfPath)}` : undefined,
+      solarLoadJustification: slj ? `/output/${path.basename(slj)}` : undefined,
+      solarLoadJustificationPacket: sljPacket ? `/output/${path.basename(sljPacket)}` : undefined
+    },
+    calculations: calc
+  });
+});
+
+app.post("/api/zip", async (req, res) => {
+  const { files, address } = req.body as { files: string[]; address: string };
+  const out = path.join("output", nameFiles(address).zip());
+  const absolute = files.filter(Boolean).map(f => path.join(process.cwd(), f.replace(/^\/+/, "")));
+  await zipFiles(absolute, out);
+  res.json({ zip: `/output/${path.basename(out)}` });
+});
+
+app.listen(PORT, () => {
+  console.log(`SGIP agent running at http://localhost:${PORT}`);
+});'''
+
+types_ts = r'''export type BillingPeriod = {
+  startDate: string;
+  endDate: string;
+  days: number;
+  kWh: number;
+  demand?: number;
+};
+
+export type ExtractedBillData = {
+  accountName: string;
+  accountId: string;
+  meterId: string;
+  serviceAddress: string;
+  rateSchedule: string;
+  utility: string;
+  billingPeriods: BillingPeriod[];
+};
+
+export type PVModule = { make: string; model: string; quantity: number };
+export type Inverter = { make: string; model: string; acKw: number };
+export type Optimizer = { make: string; model: string };
+
+export type ExtractedPlanData = {
+  pvModules: PVModule[];
+  pvPower: { dcKw: number; acKw: number };
+  inverters: Inverter[];
+  optimizers?: Optimizer[];
+  ess: { make: string; model: string; usableKwh: number; ratedKw?: number };
+  pvOrientation: { tilt: number; azimuth: number };
+  singleLinePageRef?: string;
+  meteringPoints?: string;
+};
+
+export type PVWattsData = {
+  annualKwh: number;
+  monthlyKwh: number[];
+  capacityFactor?: number;
+  solradAnnual?: number;
+  solradMonthly?: number[];
+  stationInfo?: Record<string, unknown>;
+  pdfPath?: string;
+};
+
+export type CalculationResults = {
+  averageDailyKwh: number[];
+  annualizedKwh?: number;
+  dischargeHours?: number;
+  pvChargingRequired?: number;
+  pvChargingTest?: boolean;
+  tepcCap?: number;
+  incentiveExpected?: number;
+};
+
+export type GeneratedDocuments = {
+  utilityBillsCombined?: string;
+  electricLoadJustification?: string;
+  pvWattsReport?: string;
+  solarLoadJustification?: string;
+  solarLoadJustificationPacket?: string;
+  submissionChecklist?: string;
+  zipPath?: string;
+};'''
+
+fileNaming_ts = r'''import slugify from "slugify";
+
+export const siteCompact = (addr: string) =>
+  slugify(addr.replace(/\s+/g, " "), { lower: false, remove: /[^a-zA-Z0-9\s]/g })
+    .replace(/\s+/g, "");
+
+export const dateStamp = () => {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}${mm}${dd}`;
+};
+
+export const nameFiles = (addr: string) => {
+  const SITE = siteCompact(addr);
+  const DATE = dateStamp();
+  return {
+    bills: (range: string) => `Utility_Bills_${SITE}_${range}.pdf`,
+    elj: (ver = "1.0") => `Electric_Load_Justification_${SITE}_v${ver}.pdf`,
+    pvw: (dc: number, tilt: number, az: number) =>
+      `PVWatts_${SITE}_${dc.toFixed(2)}kWDC_T${Math.round(tilt)}_A${Math.round(az)}_${DATE}.pdf`,
+    slj: (ver = "1.0") => `Solar_Load_Justification_${SITE}_v${ver}.pdf`,
+    sljPacket: (ver = "1.0") => `Solar_Load_Justification_Packet_${SITE}_v${ver}.pdf`,
+    checklist: () => `Submission_Checklist_${SITE}_${DATE}.pdf`,
+    zip: () => `SGIP_Packet_${SITE}_${DATE}.zip`
+  };
+};'''
+
+math_ts = r'''export const avgDaily = (kWh: number, days: number) => (days > 0 ? kWh / days : 0);
+
+export const dischargeHours = (usableKwh: number, ratedKw?: number) =>
+  ratedKw && ratedKw > 0 ? Math.round((usableKwh / ratedKw) * 100) / 100 : undefined;
+
+export const pv75Required = (usableKwh: number) => usableKwh * 365 * 0.75;
+
+export const tepcCap = (storageTEPC: number, itcPct = 0.3) => storageTEPC * (1 - itcPct);'''
+
+parse_ts = r'''export function last4(s: string) {
+  const m = String(s || "").match(/(\d{4})\b/);
+  return m ? m[1] : "";
+}
+
+export function compactAddress(s: string) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+
+export function parseBillTextToData(text: string): Partial<{
+  accountName: string; accountId: string; meterId: string; serviceAddress: string;
+  rateSchedule: string; utility: string;
+}> {
+  const find = (re: RegExp) => (text.match(re) || [])[1]?.trim();
+  return {
+    accountName: find(/Account\s*Name[:\s]+(.+)/i),
+    accountId: find(/Account\s*ID[:\s]+([\d\-]+)/i),
+    meterId: find(/Meter\s*(?:ID|Number)[:\s]+([\d\-]+)/i),
+    serviceAddress: find(/Service\s*Address[:\s]+(.+)/i),
+    rateSchedule: find(/Rate\s*(?:Schedule|Plan)[:\s]+([A-Z0-9\-\s]+)/i),
+    utility: find(/Pacific Gas and Electric|PG&E|SCE|SDG&E/i) || "Utility"
+  };
+}'''
+
+extract_ts = r'''import pdfParse from "pdf-parse";
+import * as fs from "fs/promises";
+import path from "path";
+import Tesseract from "tesseract.js";
+import { parseBillTextToData } from "../utils/parse.js";
+import type { ExtractedBillData, ExtractedPlanData } from "../types.js";
+
+export async function extractTextFromPdf(filePath: string) {
+  const dataBuffer = await fs.readFile(filePath);
+  const res = await pdfParse(dataBuffer);
+  return res.text || "";
+}
+
+export async function ocrImage(filePath: string) {
+  const { data } = await Tesseract.recognize(filePath, "eng", { logger: () => {} });
+  return data.text || "";
+}
+
+export async function extractBills(files: string[]): Promise<Partial<ExtractedBillData>> {
+  const periods: any[] = [];
+  const base: Partial<ExtractedBillData> = {};
+  for (const f of files) {
+    const ext = path.extname(f).toLowerCase();
+    const text = ext === ".pdf" ? await extractTextFromPdf(f) : await ocrImage(f);
+    const core = parseBillTextToData(text);
+
+    const kWh = Number((text.match(/(\d{3,7})\s*kWh\b/i) || [])[1]);
+    const days = Number((text.match(/(\d{1,3})\s*days\b/i) || [])[1]);
+    const start = (text.match(/(\d{1,2}\/\d{1,2}\/\d{2,4}).{0,10}to/i) || [])[1] || "";
+    const end = (text.match(/to.{0,10}(\d{1,2}\/\d{1,2}\/\d{2,4})/i) || [])[1] || "";
+
+    periods.push({
+      startDate: start, endDate: end,
+      days: Number.isFinite(days) ? days : 30,
+      kWh: Number.isFinite(kWh) ? kWh : 0
+    });
+
+    Object.assign(base, core, { billingPeriods: periods });
+  }
+  return base;
+}
+
+export async function extractPlans(plansPdf: string): Promise<Partial<ExtractedPlanData>> {
+  const text = await extractTextFromPdf(plansPdf);
+
+  const dcKw = Number((text.match(/Total\s*PV[\s\S]{0,40}?(\d{1,3}(\.\d{1,2})?)\s*kW\s*DC/i) || [])[1]) || 
+                Number((text.match(/(\d{1,3}(\.\d{1,2})?)\s*kW\s*DC/i) || [])[1]);
+  const acKw = Number((text.match(/(\d{1,3}(\.\d{1,2})?)\s*kW\s*AC/i) || [])[1]);
+  const tilt = Number((text.match(/tilt[:\s]+(\d{1,2})[°]?/i) || [])[1]) || 14;
+  const az = Number((text.match(/azimuth[:\s]+(\d{1,3})[°]?/i) || [])[1]) || 180;
+
+  const essMake = (text.match(/Deye|Tesla|Enphase|LG Chem|BYD/i) || [""])[0] || "ESS";
+  const essModel = (text.match(/GE[-\s]?F60|Powerwall\s*2|Encharge|RESU/i) || [""])[0] || "Model";
+  const usable = Number((text.match(/usable\s*(\d{1,3}(\.\d{1,2})?)\s*kWh/i) || [])[1]) ||
+                 Number((text.match(/(\d{1,3}(\.\d{1,2})?)\s*kWh\s*usable/i) || [])[1]) || 55.29;
+  const ratedKw = Number((text.match(/(\d{1,2}(\.\d{1,2})?)\s*kW\s*(?:cont|continuous|rated)/i) || [])[1]);
+
+  return {
+    pvPower: { dcKw: dcKw || 0, acKw: acKw || 0 },
+    pvOrientation: { tilt, azimuth: az },
+    ess: { make: essMake, model: essModel, usableKwh: usable, ratedKw }
+  };
+}'''
+
+pvwatts_ts = r'''import fetch from "node-fetch";
+import { PVWattsData } from "../types.js";
+import PDFDocument from "pdfkit";
+import fs from "fs";
+import { nameFiles } from "../utils/fileNaming.js";
+
+const NREL = process.env.NREL_API_KEY || "";
+
+async function geocode(address: string): Promise<{ lat: number; lon: number }> {
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("q", address);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("limit", "1");
+  const res = await fetch(url.toString(), { headers: { "User-Agent": "sgip-agent/1.0" } });
+  const data: any[] = await res.json();
+  if (!data?.length) throw new Error("Geocoding failed: no results");
+  return { lat: Number(data[0].lat), lon: Number(data[0].lon) };
+}
+
+export async function runPVWatts(opts: {
+  address: string; dcKw: number; tilt: number; azimuth: number;
+  losses?: number; arrayType?: number; moduleType?: number;
+  siteAddrCompact: string; outputDir: string;
+}): Promise<PVWattsData> {
+  if (!NREL) throw new Error("Missing NREL API key. Set NREL_API_KEY in .env");
+
+  const losses = Number.isFinite(opts.losses!) ? (opts.losses as number) : 14;
+  const arrayType = Number.isFinite(opts.arrayType!) ? (opts.arrayType as number) : 1;
+  const moduleType = Number.isFinite(opts.moduleType!) ? (opts.moduleType as number) : 0;
+
+  const { lat, lon } = await geocode(opts.address);
+
+  const url = new URL("https://developer.nrel.gov/api/pvwatts/v8.json");
+  url.searchParams.set("api_key", NREL);
+  url.searchParams.set("system_capacity", String(opts.dcKw));
+  url.searchParams.set("module_type", String(moduleType));
+  url.searchParams.set("losses", String(losses));
+  url.searchParams.set("array_type", String(arrayType));
+  url.searchParams.set("tilt", String(opts.tilt));
+  url.searchParams.set("azimuth", String(opts.azimuth));
+  url.searchParams.set("timeframe", "monthly");
+  url.searchParams.set("dataset", "nsrdb");
+  url.searchParams.set("lat", String(lat));
+  url.searchParams.set("lon", String(lon));
+  url.searchParams.set("radius", "0");
+
+  const res = await fetch(url.toString());
+  const json: any = await res.json();
+
+  if (json?.errors?.length) {
+    throw new Error(`PVWatts error: ${json.errors.join("; ")}`);
+  }
+  const out = json?.outputs;
+  if (!out?.ac_annual || !out?.ac_monthly) {
+    throw new Error("PVWatts incomplete response");
+  }
+
+  const filename = nameFiles(opts.siteAddrCompact).pvw(opts.dcKw, opts.tilt, opts.azimuth);
+  const pdfPath = `${opts.outputDir}/${filename}`;
+  await new Promise<void>((resolve, reject) => {
+    const doc = new PDFDocument({ size: "LETTER", margin: 40 });
+    const stream = fs.createWriteStream(pdfPath);
+    doc.pipe(stream);
+
+    doc.fontSize(16).text("PVWatts® (V8) Production Summary", { align: "left" });
+    doc.moveDown(0.5);
+    doc.fontSize(9).text(`Address: ${opts.address}`);
+    doc.text(`Lat/Lon: ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
+    doc.text(`Weather Dataset: NSRDB (TMY)`);
+    doc.moveDown();
+
+    doc.fontSize(11).text("Inputs", { underline: true });
+    doc.fontSize(9)
+      .text(`DC Size: ${opts.dcKw.toFixed(2)} kW`)
+      .text(`Tilt: ${opts.tilt}°  |  Azimuth: ${opts.azimuth}°`)
+      .text(`Array Type: ${arrayType} (1=fixed roof)  |  Module Type: ${moduleType} (0=standard)`)
+      .text(`Losses: ${losses}%`);
+    doc.moveDown();
+
+    doc.fontSize(11).text("Outputs", { underline: true });
+    doc.fontSize(9)
+      .text(`Annual AC Energy: ${Math.round(out.ac_annual).toLocaleString()} kWh`)
+      .text(`Capacity Factor: ${out.capacity_factor?.toFixed?.(2) ?? "—"} %`);
+    doc.moveDown();
+
+    doc.fontSize(10).text("Monthly AC Energy (kWh)", { underline: true });
+    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    out.ac_monthly.forEach((v: number, i: number) => {
+      doc.fontSize(9).text(`${months[i]}: ${Math.round(v).toLocaleString()}`);
+    });
+
+    doc.moveDown(1);
+    doc.fontSize(8).text("Source: NREL PVWatts® API v8  |  https://developer.nrel.gov");
+    doc.end();
+    stream.on("finish", () => resolve());
+    stream.on("error", reject);
+  });
+
+  return {
+    annualKwh: Number(out.ac_annual),
+    monthlyKwh: out.ac_monthly.map((n: number) => Number(n)),
+    capacityFactor: out.capacity_factor ? Number(out.capacity_factor) : undefined,
+    solradAnnual: out.solrad_annual ? Number(out.solrad_annual) : undefined,
+    solradMonthly: out.solrad_monthly?.map((n: number) => Number(n)),
+    stationInfo: json.station_info,
+    pdfPath
+  };
+}'''
+
+pdf_ts = r'''import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import fs from "fs/promises";
+import path from "path";
+import { nameFiles } from "../utils/fileNaming.js";
+import type { ExtractedBillData, ExtractedPlanData, PVWattsData, CalculationResults } from "../types.js";
+
+export async function combineBillsToPdf(inputs: string[], outPath: string) {
+  const out = await PDFDocument.create();
+  for (const p of inputs) {
+    const bytes = await fs.readFile(p);
+    if (p.toLowerCase().endsWith(".pdf")) {
+      const src = await PDFDocument.load(bytes);
+      const copied = await out.copyPages(src, src.getPageIndices());
+      copied.forEach(page => out.addPage(page));
+    } else {
+      const page = out.addPage([612, 792]);
+      // naive image embed: assume jpg; extend to detect png
+      const jpg = await out.embedJpg(bytes);
+      const scale = 550 / jpg.width;
+      const width = jpg.width * scale;
+      const height = jpg.height * scale;
+      page.drawImage(jpg, { x: 30, y: 792 - height - 30, width, height });
+    }
+  }
+  const pdf = await out.save();
+  await fs.writeFile(outPath, pdf);
+}
+
+export async function generateElectricLoadJustification(opts: {
+  addr: string; bills: ExtractedBillData; calc: CalculationResults; outDir: string; version?: string;
+}) {
+  const SITE = nameFiles(opts.addr);
+  const filename = SITE.elj(opts.version || "1.0");
+  const outPath = path.join(opts.outDir, filename);
+
+  const pdf = await PDFDocument.create();
+  const page = pdf.addPage([612, 792]);
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+
+  const draw = (text: string, x: number, y: number, f = font, size = 9) =>
+    page.drawText(text, { x, y, size, font: f, color: rgb(0, 0, 0) });
+
+  let y = 760;
+  page.drawText("Electric Load Justification", { x: 40, y, size: 14, font: bold });
+  y -= 20;
+  draw(`Project: ${opts.addr}`, 40, y); y -= 14;
+  draw(`Utility: ${opts.bills.utility} | Rate: ${opts.bills.rateSchedule}`, 40, y); y -= 14;
+  draw(`Account ID (last 4): ${opts.bills.accountId?.slice(-4) ?? ""} | Meter ID (last 4): ${opts.bills.meterId?.slice(-4) ?? ""}`, 40, y);
+  y -= 22;
+
+  page.drawText("Billing Summary", { x: 40, y, size: 11, font: bold }); y -= 16;
+  const periods = opts.bills.billingPeriods || [];
+  periods.slice(0, 10).forEach((p, i) => {
+    const avg = opts.calc.averageDailyKwh?.[i];
+    draw(`${p.startDate} to ${p.endDate} | ${p.days} days | ${p.kWh.toLocaleString()} kWh | Avg ${avg ? avg.toFixed(0) : "-"} kWh/day`, 40, y);
+    y -= 14;
+  });
+  y -= 8;
+
+  page.drawText("Conclusion", { x: 40, y, size: 11, font: bold }); y -= 16;
+  draw(
+    "Based on billing data, the proposed PV+ESS is not oversized relative to site load. Battery capacity and PV output are below annual consumption, meeting SGIP sizing expectations.",
+    40, y
+  );
+
+  const bytes = await pdf.save();
+  await fs.writeFile(outPath, bytes);
+  return outPath;
+}
+
+export async function generateSolarLoadJustification(opts: {
+  addr: string; plan: ExtractedPlanData; pvw: PVWattsData; calc: CalculationResults; outDir: string; version?: string;
+}) {
+  const SITE = nameFiles(opts.addr);
+  const filename = SITE.slj(opts.version || "1.0");
+  const outPath = path.join(opts.outDir, filename);
+
+  const pdf = await PDFDocument.create();
+  const page = pdf.addPage([612, 792]);
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+
+  const draw = (text: string, x: number, y: number, f = font, size = 9) =>
+    page.drawText(text, { x, y, size, font: f, color: rgb(0, 0, 0) });
+
+  let y = 760;
+  page.drawText("Solar Load Justification", { x: 40, y, size: 14, font: bold }); y -= 20;
+  draw(`Project: ${opts.addr}`, 40, y); y -= 14;
+  draw(`PV Size: ${opts.plan.pvPower?.dcKw?.toFixed?.(2)} kW DC / ${opts.plan.pvPower?.acKw?.toFixed?.(1) ?? "-"} kW AC`, 40, y); y -= 14;
+  draw(`Tilt: ${opts.plan.pvOrientation?.tilt ?? "-"}° | Azimuth: ${opts.plan.pvOrientation?.azimuth ?? "-" }°`, 40, y); y -= 14;
+  draw(`PVWatts Annual: ${Math.round(opts.pvw.annualKwh).toLocaleString()} kWh`, 40, y); y -= 14;
+  draw(`75% Solar Charging Required: ~${Math.round(opts.calc.pvChargingRequired ?? 0).toLocaleString()} kWh/yr`, 40, y);
+  y -= 16;
+
+  page.drawText("Conclusion", { x: 40, y, size: 11, font: bold }); y -= 16;
+  draw(
+    `PVWatts annual energy ${opts.calc.pvChargingTest ? "meets or exceeds" : "does not meet"} the minimum required to support ≥75% renewable charging for the ESS.`,
+    40, y
+  );
+
+  const bytes = await pdf.save();
+  await fs.writeFile(outPath, bytes);
+  return outPath;
+}
+
+export async function mergeTwoPdfs(aPath: string, bPath: string, outPath: string) {
+  const [aBytes, bBytes] = await Promise.all([fs.readFile(aPath), fs.readFile(bPath)]);
+  const aDoc = await PDFDocument.load(aBytes);
+  const bDoc = await PDFDocument.load(bBytes);
+  const out = await PDFDocument.create();
+  const aPages = await out.copyPages(aDoc, aDoc.getPageIndices());
+  aPages.forEach(p => out.addPage(p));
+  const bPages = await out.copyPages(bDoc, bDoc.getPageIndices());
+  bPages.forEach(p => out.addPage(p));
+  const bytes = await out.save();
+  await fs.writeFile(outPath, bytes);
+}'''
+
+zip_ts = r'''import * as fs from "fs/promises";
+import * as path from "path";
+import { BlobWriter, ZipWriter } from "@zip.js/zip.js";
+
+export async function zipFiles(files: string[], outPath: string) {
+  const writer = new ZipWriter(new BlobWriter("application/zip"));
+  for (const f of files) {
+    const data = await fs.readFile(f);
+    await writer.add(path.basename(f), new Response(data).body as any);
+  }
+  const blob = await writer.close();
+  const buf = Buffer.from(await blob.arrayBuffer());
+  await fs.writeFile(outPath, buf);
+}'''
+
+index_html = r'''<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SGIP Application Assistant</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>SGIP Application Assistant</h1>
+    <p class="sub">Upload your plans & bills, enter the address, then generate your packet.</p>
+
+    <section class="card">
+      <h2>Step 1 — Upload</h2>
+      <form id="uploadForm">
+        <label>Project Address
+          <input type="text" name="address" placeholder="290 W 10th St, Pittsburg, CA 94565" required>
+        </label>
+        <label>Planset (PDF)
+          <input type="file" name="plans" accept="application/pdf" required>
+        </label>
+        <label>Utility Bills (PDF or images, multiple)
+          <input type="file" name="bills" multiple required>
+        </label>
+        <label>PVWatts PDF (optional)
+          <input type="file" name="pvwattsPdf" accept="application/pdf">
+        </label>
+        <button type="submit">Upload</button>
+      </form>
+      <pre id="uploadOut" class="mono small"></pre>
+    </section>
+
+    <section class="card">
+      <h2>Step 2 — Process & Generate</h2>
+      <form id="procForm">
+        <label>Storage TEPC (optional) <input type="number" step="0.01" name="storageTEPC" placeholder="87900"></label>
+        <label>Storage ITC % <input type="number" name="storageITC" value="30"></label>
+        <button type="submit">Process</button>
+      </form>
+      <div id="results"></div>
+    </section>
+
+    <section class="card">
+      <h2>Step 3 — Download All</h2>
+      <button id="zipBtn">Create ZIP</button>
+      <div id="zipOut"></div>
+    </section>
+
+    <footer>© SGIP Assistant</footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>'''
+
+styles_css = r'''body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#f7f7fb; color:#222; }
+.container { max-width: 900px; margin: 40px auto; padding: 0 16px; }
+h1 { margin: 0 0 8px; }
+.sub { color:#555; margin: 0 0 24px; }
+.card { background:white; border-radius: 10px; padding:16px 18px; margin:18px 0; box-shadow: 0 4px 16px rgba(0,0,0,0.05); }
+label { display:block; margin: 8px 0; }
+input[type="text"], input[type="number"] { width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; }
+button { background:#4e73df; color:white; border:none; padding:10px 14px; border-radius:8px; cursor:pointer; }
+button:hover { background:#3f60c0; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.small { font-size: 12px; white-space: pre-wrap; }
+a { color:#4e73df; text-decoration: none; }
+a:hover { text-decoration: underline; }'''
+
+app_js = r'''const state = { upload: null, outputs: null, address: "" };
+
+const $ = sel => document.querySelector(sel);
+
+document.getElementById("uploadForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  state.address = fd.get("address");
+  const res = await fetch("/api/upload", { method: "POST", body: fd });
+  const json = await res.json();
+  document.getElementById("uploadOut").textContent = JSON.stringify(json, null, 2);
+  if (json.error) return;
+  state.upload = json;
+  alert("Uploaded. Now click 'Process'.");
+});
+
+document.getElementById("procForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!state.upload) { alert("Upload first."); return; }
+  const fd = new FormData(e.target);
+  const body = {
+    plans: state.upload.plans,
+    bills: state.upload.bills,
+    address: state.upload.address,
+    storageTEPC: Number(fd.get("storageTEPC") || 0),
+    storageITC: Number(fd.get("storageITC") || 30)
+  };
+  const res = await fetch("/api/process", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const json = await res.json();
+  renderResults(json);
+  state.outputs = json.outputs || {};
+});
+
+function link(label, href) {
+  if (!href) return "";
+  return `<div><a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;
+}
+
+function renderResults(r) {
+  const el = document.getElementById("results");
+  if (!r?.ok) { el.innerHTML = `<div class="mono small">${JSON.stringify(r,null,2)}</div>`; return; }
+  const out = r.outputs || {};
+  const calc = r.calculations || {};
+  const pvw = r.pvwatts;
+  el.innerHTML = `
+    <h3>Outputs</h3>
+    ${link("Utility Bills (Combined)", out.utilityBillsCombined)}
+    ${link("Electric Load Justification", out.electricLoadJustification)}
+    ${link("PVWatts Summary", out.pvWattsReport)}
+    ${link("Solar Load Justification", out.solarLoadJustification)}
+    ${link("Solar Load Justification Packet", out.solarLoadJustificationPacket)}
+    <h3>PVWatts</h3>
+    <div class="mono small">${pvw?.error ? pvw.error : JSON.stringify({ annualKwh: pvw.annualKwh, monthlyKwh: pvw.monthlyKwh }, null, 2)}</div>
+    <h3>Calculations</h3>
+    <div class="mono small">${JSON.stringify(calc, null, 2)}</div>
+  `;
+}
+
+document.getElementById("zipBtn").addEventListener("click", async () => {
+  if (!state.outputs) { alert("Process first."); return; }
+  const files = Object.values(state.outputs).filter(Boolean);
+  const res = await fetch("/api/zip", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ files, address: state.address })
+  });
+  const json = await res.json();
+  document.getElementById("zipOut").innerHTML = json.zip ? `<a href="${json.zip}" target="_blank" rel="noopener">Download ZIP</a>` : "Error.";
+});'''
+
+# Write files
+files = {
+    f"{base}/package.json": package_json,
+    f"{base}/tsconfig.json": tsconfig,
+    f"{base}/.env.sample": env_sample,
+    f"{base}/.gitignore": gitignore,
+    f"{base}/src/server.ts": server_ts,
+    f"{base}/src/types.ts": types_ts,
+    f"{base}/src/utils/fileNaming.ts": fileNaming_ts,
+    f"{base}/src/utils/parse.ts": parse_ts,
+    f"{base}/src/utils/math.ts": math_ts,
+    f"{base}/src/services/extract.ts": extract_ts,
+    f"{base}/src/services/pvwatts.ts": pvwatts_ts,
+    f"{base}/src/services/pdf.ts": pdf_ts,
+    f"{base}/src/services/zip.ts": zip_ts,
+    f"{base}/public/index.html": index_html,
+    f"{base}/public/styles.css": styles_css,
+    f"{base}/public/app.js": app_js,
+}
+
+for path, content in files.items():
+  with open(path, "w", encoding="utf-8") as f:
+    f.write(content)
+
+# Zip the whole project
+zip_path = "/mnt/data/sgip-agent.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+  for folder, _, filenames in os.walk(base):
+    for fn in filenames:
+      full = os.path.join(folder, fn)
+      arcname = os.path.relpath(full, "/mnt/data")
+      z.write(full, arcname)
+
+zip_path
